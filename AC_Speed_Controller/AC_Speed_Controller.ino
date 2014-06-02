@@ -1,3 +1,5 @@
+#include <EEPROM.h>
+#include <PID_AutoTune_v0.h>
 #include <TimerOne.h>
 #include <PID_v1.h>
 
@@ -5,13 +7,13 @@
 #define inputPin A0     // Input from CNC controller
 #define tachPin 3       // Input from Tach signal
 #define zeroPin 2       // Input from Zero Cross Detector
+#define autoTune 4      // Input to activate PID AutoTune
 #define FREQ 60 	// 60Hz power in these parts
 
+bool firstRun = true; //Initialize PID settings after code reload
 
-double Setpoint, Input, Output;  //Define Variables we'll be connecting PID to
+double Setpoint = 0, Input = 0, Output = 0;  //Define Variables we'll be connecting PID to
 double wait = 3276700000;  //find the squareroot of this in your spare time please
-PID myPID(&Input, &Output, &Setpoint,2,5,1, REVERSE);  //Specify the links and initial tuning parameters - PID takes RPM from tach as input, RPM from ADC0 as setpoint and gives phase delay time as output
-int windowSize = 8333;  // AC half wave takes ~8333 microseconds
 int tachMax = 29667;  // Maximum motor RPM
 int inputScaler = tachMax/1023; //scalar value to convert analog input to RPM value for PID input
 volatile long tachCount = 0;  // Counter for tach signal
@@ -21,21 +23,39 @@ int inputWindow = 1000;  // time in milliseconds that ADC0 input is sampled and 
 double now, then, timeOld;  //timer variables for main loop
 int inputTemp = 0;
 
+//setup PID and AutoTune parameters
+byte ATuneModeRemember=2;
+double kp=.0821,ki=0.725,kd=.028;
+double kpmodel=1.5, taup=100, theta[50];
+double outputStart=5;
+double aTuneStep=50, aTuneNoise=1, aTuneStartValue=100;
+unsigned int aTuneLookBack=20;
+boolean tuning = false;
+PID myPID(&Input, &Output, &Setpoint,kp,ki,kd, REVERSE);
+PID_ATune aTune(&Input, &Output);
+
 void setup() {
-  //initialize the variables we're linked to
-  Setpoint = 0;
+  //Retrieve stored PID tunings
+  firstRun = EEPROM.read(0);
+  if (!firstRun){
+    getPIDtune();
+  }
+  else {
+    setPIDtune();
+  }
   
   // setup pins
   pinMode(triacPin, OUTPUT);
   digitalWrite(triacPin, LOW);
   pinMode(tachPin, INPUT_PULLUP);
   pinMode(zeroPin, INPUT);
+  pinMode(autoTune, INPUT_PULLUP);
   
   //set PID calculation frequency
-  myPID.SetSampleTime(100);
+  myPID.SetSampleTime(200);
   
   //tell the PID to range between 0 and the full window size
-  myPID.SetOutputLimits(0, windowSize);
+  myPID.SetOutputLimits(0, period);
   
   //turn the PID on
   myPID.SetMode(AUTOMATIC);
@@ -52,10 +72,13 @@ void setup() {
   //setup ISR routines
   attachInterrupt(0,zeroCross, FALLING);  //IRQ0 is pin 2. Call zeroCrossingInterrupt on FALLING signal
   attachInterrupt(1,tachSense, FALLING);  //IRQ1 is pin 3. Call tachSense on FALLING signal
-    
+  
 }
 
 void loop() {
+  if(!digitalRead(autoTune)) {
+    changeAutoTune();
+  }
   now = millis();
   if(now-then >= inputWindow){
     Setpoint = analogRead(triacPin)*inputScaler;
@@ -65,21 +88,37 @@ void loop() {
     Input = (60000/(millis() - timeOld)) * tachCount;
     timeOld = millis();
     tachCount = 0;
+  }
+  if (!tuning){
     myPID.Compute();
+  }
+  else {
+    byte val = (aTune.Runtime());
+    if (val!=0)
+    {
+      tuning = false;
+    }
+    if(!tuning){ //we're done, set the tuning parameters
+      kp = aTune.GetKp();
+      ki = aTune.GetKi();
+      kd = aTune.GetKd();
+      myPID.SetTunings(kp,ki,kd);
+      setPIDtune();
+      AutoTuneHelper(false);
+    }
   }
 }
 
 
 void zeroCross(){  //Zero cross detection ISR
   Timer1.restart();
-  state=1;
   if (Output>=7915) {			//if Output is < 5%
     digitalWrite(triacPin, LOW);	//stay off all the time
-    state=0;			// no update this period
   }
   else	//otherwise we want the motor at some middle setting
   {
     Timer1.attachInterrupt(nowIsTheTime,Output);
+    state = false;
   }
 
 }
@@ -90,22 +129,60 @@ void tachSense(){  //Tach input counter
 
 void nowIsTheTime ()
 {
-  if (state=1) {
+  if (!state){
     Timer1.attachInterrupt(nowIsTheTime, (Output + 8333));
   }
-  if (state>=1)		//the interrupt has been engaged and we are in the dwell time....
+  digitalWrite(triacPin,HIGH);
+  wait = sqrt(wait);		//delay wont work in an interrupt.
+  if (!wait)                      // this takes 80uS or so on a 16Mhz proc
   {
-    digitalWrite(triacPin,HIGH);
-    wait = sqrt(wait);		//delay wont work in an interrupt.
-    if (!wait)                      // this takes 80uS or so on a 16Mhz proc
-    {
-      wait = 3276700000;
-    }
-    digitalWrite(triacPin,LOW);
-    state++;
-    if (state==3){
-      Timer1.detachInterrupt();
-    }
+    wait = 3276700000;
   }
+  digitalWrite(triacPin,LOW);
+  if (state){
+    Timer1.detachInterrupt();
+  }
+  else state = true;
+}
+
+void changeAutoTune()
+{
+ if(!tuning)
+  {
+    //Set the output to the desired starting frequency.
+    Output=aTuneStartValue;
+    aTune.SetNoiseBand(aTuneNoise);
+    aTune.SetOutputStep(aTuneStep);
+    aTune.SetLookbackSec((int)aTuneLookBack);
+    AutoTuneHelper(true);
+    tuning = true;
+  }
+  else
+  { //cancel autotune
+    aTune.Cancel();
+    tuning = false;
+    AutoTuneHelper(false);
+  }
+}
+
+void AutoTuneHelper(boolean start)
+{
+  if(start)
+    ATuneModeRemember = myPID.GetMode();
+  else
+    myPID.SetMode(ATuneModeRemember);
+}
+
+void setPIDtune(){
+  EEPROM.write(0,0);
+  EEPROM.write(1,kp);
+  EEPROM.write(2,ki);
+  EEPROM.write(3,kd);
+}
+
+void getPIDtune(){
+  kp = EEPROM.read(1);
+  ki = EEPROM.read(2);
+  kd = EEPROM.read(3);
 }
 
